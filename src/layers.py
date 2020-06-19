@@ -130,49 +130,65 @@ def get_EF(input_size, dim):
     torch.nn.init.xavier_normal_(EF.weight)
     return EF
 
+
+
+
 #### Bilinear Linformer Capsule Layer ####
 class BilinearLinformerCapsuleFC(nn.Module):
     r"""Applies as a capsule fully-connected layer.
     TBD
     """
 
-    def __init__(self, hidden_dim, input_size, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, kernel_size, stride, padding, group_size, parameter_sharing, matrix_pose, dp):
+    def __init__(self, hidden_dim, input_size, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, h_out, child_kernel_size, child_stride, child_padding, parent_kernel_size, parent_stride, parent_padding, parameter_sharing, matrix_pose, dp):
 
         super(BilinearLinformerCapsuleFC, self).__init__()
         self.in_n_capsules = in_n_capsules
         self.in_d_capsules = in_d_capsules
         self.out_n_capsules = out_n_capsules
         self.out_d_capsules = out_d_capsules
+        self.h_out=h_out
         self.matrix_pose = matrix_pose
         self.hidden_dim =hidden_dim
+        self.parameter_sharing=parameter_sharing
         
-        assert self.in_n_capsules % (input_size * input_size) == 0, "Something fishy"
-        self.actual_channels = int(self.in_n_capsules/(input_size * input_size))
-
-        self.current_grouped_conv = nn.Conv2d(in_channels=self.actual_channels*in_d_capsules,
-                                     out_channels=self.actual_channels*in_d_capsules,
-                                     kernel_size=kernel_size,
-                                     stride=stride,
-                                     padding=padding,
-                                     groups=group_size,
+        # print("Input size is ", input_size)
+        # assert self.in_n_capsules % (input_size * input_size) == 0, "Something fishy"
+        self.actual_capstypes = int(self.in_n_capsules/(input_size * input_size))
+        self.actual_capstypes = in_n_capsules
+        # Input: (32,16,16,256)
+        
+        self.current_grouped_conv = nn.Conv2d(in_channels=self.actual_capstypes*in_d_capsules,
+                                     out_channels=self.actual_capstypes*in_d_capsules,
+                                     kernel_size=child_kernel_size,
+                                     stride=child_stride,
+                                     padding=child_padding,
+                                     groups=self.actual_capstypes,
                                      bias=False)
 
         self.next_grouped_conv = nn.Conv2d(in_channels=out_n_capsules*out_d_capsules,
                                      out_channels=out_n_capsules*out_d_capsules,
-                                     kernel_size=kernel_size,
-                                     stride=stride,
-                                     padding=padding,
-                                     groups=group_size,
+                                     kernel_size= parent_kernel_size ,
+                                     stride=parent_stride,
+                                     padding=parent_padding,
+                                     groups=self.actual_capstypes,
                                      bias=False)
         
         
-        BilinearOutImg_size = int((input_size - kernel_size + 2* padding)/stride)+1
-        print("Helooooo", BilinearOutImg_size, " ", self.actual_channels)
-        if parameter_sharing != "layerwise":
-            self.E_proj = get_EF(BilinearOutImg_size*BilinearOutImg_size * self.actual_channels , hidden_dim)
-            self.F_proj = get_EF(BilinearOutImg_size*BilinearOutImg_size * self.actual_channels, hidden_dim) if parameter_sharing == "none" or parameter_sharing == "headwise" else E_proj
-          
-               
+        BilinearOutImg_size = int((input_size - child_kernel_size + 2* child_padding)/child_stride)+1
+        # print("Helooooo", BilinearOutImg_size, " ", self.actual_capstypes)
+        
+        
+
+
+        E_proj_list=[]
+        if parameter_sharing == "headwise":
+            self.E_proj = nn.Parameter(0.02*torch.randn(BilinearOutImg_size * BilinearOutImg_size, self.hidden_dim))
+
+        else:
+            # Correct this
+            self.E_proj = nn.Parameter(0.02*torch.randn(self.actual_capstypes, self.in_d_capsules, 
+                                    BilinearOutImg_size, BilinearOutImg_size))
+  
 
         self.dropout_rate = dp
         self.nonlinear_act = nn.LayerNorm(out_d_capsules)
@@ -187,16 +203,20 @@ class BilinearLinformerCapsuleFC(nn.Module):
             self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, self.matrix_pose,
             self.weight_init_const, self.dropout_rate
         )        
-    def forward(self, current_pose, num_iter, next_pose = None, h_out=1, w_out=1):
+    def forward(self, current_pose, num_iter, next_pose = None):
         # b: batch size
         # n: num of capsules in current layer
         # a: dim of capsules in current layer
         # m: num of capsules in next layer
         # d: dim of capsules in next layer
         # current_pose shape: (b, num_Capsules, height, width, caps_dim), eg (b,32,16,16,256)
+        h_out=self.h_out
+        w_out=h_out
+        
         input_height, input_width = current_pose.shape[2], current_pose.shape[3]
         batch_size = current_pose.shape[0]
         pose_dim=self.in_d_capsules
+        
         # Applying grouped convolution across capsule dimension
         if len(current_pose.shape) == 5:
             current_pose = current_pose.permute(0,2,3,1,4)
@@ -204,51 +224,72 @@ class BilinearLinformerCapsuleFC(nn.Module):
             current_pose = current_pose.permute(0,3,1,2)
 
         # current_pose : (b, 32*256, 16, 16) --> (b, 32*256, a, b) --> (b,32*a*b,256) == (b,n,d) in sequences
+        # Check this once, Group size = num_caps
         current_pose = self.current_grouped_conv(current_pose)
         
-        current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules, -1)
-        current_pose = current_pose.permute(0,2,1)
-        # Headwise sharing across capsule types, key-value sharing, layer-wise sharing
-        # shape : (b, hidden_dim, caps_dim)
-        # print(current_pose.shape)
-        
-        transposed = torch.transpose(current_pose, 1, 2)
-        # print(transposed.shape)
-        k_val = self.E_proj(transposed)
-        v_val = self.F_proj(transposed)
+        if self.parameter_sharing == 'headwise':
+            # (a*b, hidden_dim) --> 
+            E_proj = self.E_proj
+            # E_proj=E_proj.unsqueeze(0) 
+            # Current pose becomes (b,256,32,a*b) 
+            current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules,self.actual_capstypes,current_pose.shape[2] * current_pose.shape[3] )
+                
+            # k_val - (b,32,256,hidden dim)
+            # print(current_pose.shape, E_proj.shape)
+            k_val = torch.matmul(current_pose, E_proj)
+            # reshaped to (b,256, hidden_dim*32)
+            k_val = k_val.reshape(current_pose.shape[0], pose_dim, -1)
+            k_val = k_val.permute(0,2,1)
+            # print("Shape of k val is", k_val.shape)
+            new_n_capsules = k_val.shape[1]
+
+        else:
+            # Correct this
+            current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules, -1)
+            current_pose = current_pose.permute(0,2,1)        
+            transposed = torch.transpose(current_pose, 1, 2)
+            k_val = self.E_proj(transposed)
+            k_val = k_val.permute(0,2,1)
+            new_n_capsules = int(k_val.shape[1])
+
 
         # shape: (b, new_num_capsules, caps_dim)
-        k_val, v_val =k_val.permute(0,2,1), v_val.permute(0,2,1)
-        new_n_capsules = int(k_val.shape[1])
+        
         # print('Perm shape: ', k_val.shape," ", v_val.shape)
         
         if next_pose is None:
             # print(batch_size,self.out_n_capsules,  pose_dim)
-            dots = (torch.ones(batch_size*h_out*w_out, self.out_n_capsules, new_n_capsules)* (pose_dim ** -0.5)).type_as(k_val).to(k_val)
+            dots = (torch.ones(batch_size, self.out_n_capsules*h_out*w_out, new_n_capsules)* (pose_dim ** -0.5)).type_as(k_val).to(k_val)
             dots = F.softmax(dots, dim=-2)
-            # print(dots.shape, v_val.shape)
+            # print(dots.shape, k_val.shape)
             # output shape: b, out_caps, caps_dim
-            next_pose = torch.einsum('bji,bie->bje', dots, v_val)
-            next_pose= next_pose.reshape(next_pose.shape[0],next_pose.shape[1]*next_pose.shape[2],1,1)
+            
+            next_pose = torch.einsum('bji,bie->bje', dots, k_val)
+            next_pose= next_pose.reshape(next_pose.shape[0],self.out_n_capsules * pose_dim,h_out,w_out)
             next_pose = self.next_grouped_conv(next_pose)
         
             next_pose =next_pose.reshape(batch_size, self.out_n_capsules, h_out, w_out, pose_dim)
             return next_pose
         else:
-            # next pose: (b,m,h_out,w_out,out_caps_dim)
+            # next pose: (b,m,h_out,w_out,out_caps_dim) --> (b, m*out_cap_dim, h_out, w_out)
             h_out = next_pose.shape[2]
             w_out = next_pose.shape[3]
             next_pose = next_pose.permute(0,2,3,1,4)
             next_pose = next_pose.contiguous().view(next_pose.shape[0], next_pose.shape[1], next_pose.shape[2],-1)
             next_pose = next_pose.permute(0,3,1,2)
             next_pose = self.next_grouped_conv(next_pose)
+
+            # (b, m*out_cap_dim, a, b) --> (b, m*a*b, out_caps_dim)
             next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules * next_pose.shape[2] * next_pose.shape[3], self.out_d_capsules)
 
             dots = torch.einsum('bje,bie->bji', next_pose, k_val) * (pose_dim ** -0.5) 
             dots = dots.softmax(dim=-2) 
-            next_pose = torch.einsum('bji,bie->bje', dots, v_val)
-            next_pose= next_pose.reshape(next_pose.shape[0],next_pose.shape[1]*next_pose.shape[2],1,1)
+            next_pose = torch.einsum('bji,bie->bje', dots, k_val)
+            # (b, m*a*b, out_caps_dim) --> (b, m*out_dim, a, b)
+            next_pose= next_pose.reshape(next_pose.shape[0],self.out_n_capsules * pose_dim,h_out,w_out)
             next_pose = self.next_grouped_conv(next_pose)
+
+            # (b, m , a, b, out_caps_dim)
             next_pose =next_pose.reshape(batch_size, self.out_n_capsules, h_out, w_out, pose_dim)
 
 
