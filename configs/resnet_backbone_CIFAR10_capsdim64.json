@@ -1,0 +1,70 @@
+{
+    "backbone": {
+        "kernel_size": 3,
+        "output_dim": 128,
+        "input_dim": 3,
+        "stride": 2,
+        "padding": 1,
+        "out_img_size": 16
+        },
+    "primary_capsules": {
+        "kernel_size": 1,
+        "stride": 1,
+        "input_dim": 128,
+        "caps_dim": 64,
+        "num_caps": 32,
+        "padding": 0,
+        "out_img_size": 16
+        },
+    "capsules": [
+        {
+            "type": "FC",
+            "child_kernel_size": 3,
+            "child_stride": 1,
+            "child_padding": 1,
+            "parent_kernel_size": 1,
+            "parent_stride": 1,
+            "parent_padding": 0,
+            "num_caps": 32,
+            "caps_dim": 64,
+            "hidden_dim": 48,
+            "parameter_sharing":"headwise",
+            "h_out": 11,
+            "matrix_pose": false
+        }, 
+
+        {
+            "type": "FC",
+            "child_kernel_size": 3,
+            "child_stride": 1,
+            "child_padding": 1,
+            "parent_kernel_size": 1,
+            "parent_stride": 1,
+            "parent_padding": 0,
+            "num_caps": 32,
+            "caps_dim": 64,
+            "hidden_dim": 32,
+            "parameter_sharing":"headwise",
+            "h_out": 7,
+            "matrix_pose": false
+        }
+
+    ],
+    "class_capsules": {
+
+            "type": "FC",
+            "child_kernel_size": 3,
+            "child_stride": 1,
+            "child_padding": 1,
+            "parent_kernel_size": 1,
+            "parent_stride": 1,
+            "parent_padding": 0,
+            "num_caps": 10,
+            "caps_dim": 64,
+            "hidden_dim": 32,
+            "parameter_sharing":"headwise",
+            "h_out": 1,
+            "matrix_pose": false
+
+        }
+    }
