@@ -151,18 +151,13 @@ class BilinearLinformerCapsuleFC(nn.Module):
         self.hidden_dim =hidden_dim
         self.parameter_sharing=parameter_sharing
         
-        # print("Input size is ", input_size)
-        # assert self.in_n_capsules % (input_size * input_size) == 0, "Something fishy"
-        self.actual_capstypes = int(self.in_n_capsules/(input_size * input_size))
-        self.actual_capstypes = in_n_capsules
-        # Input: (32,16,16,256)
         
-        self.current_grouped_conv = nn.Conv2d(in_channels=self.actual_capstypes*in_d_capsules,
-                                     out_channels=self.actual_capstypes*in_d_capsules,
+        self.current_grouped_conv = nn.Conv2d(in_channels=self.in_n_capsules*in_d_capsules,
+                                     out_channels=self.in_n_capsules*in_d_capsules,
                                      kernel_size=child_kernel_size,
                                      stride=child_stride,
                                      padding=child_padding,
-                                     groups=self.actual_capstypes,
+                                     groups=self.in_n_capsules,
                                      bias=False)
 
         self.next_grouped_conv = nn.Conv2d(in_channels=out_n_capsules*out_d_capsules,
@@ -170,25 +165,25 @@ class BilinearLinformerCapsuleFC(nn.Module):
                                      kernel_size= parent_kernel_size ,
                                      stride=parent_stride,
                                      padding=parent_padding,
-                                     groups=self.actual_capstypes,
+                                     groups=self.in_n_capsules,
                                      bias=False)
         
         
         BilinearOutImg_size = int((input_size - child_kernel_size + 2* child_padding)/child_stride)+1
-        # print("Helooooo", BilinearOutImg_size, " ", self.actual_capstypes)
-        
-        
-
-
-        E_proj_list=[]
+            
         if parameter_sharing == "headwise":
-            self.E_proj = nn.Parameter(0.02*torch.randn(BilinearOutImg_size * BilinearOutImg_size, self.hidden_dim))
+            self.E_proj = nn.Parameter(0.02*torch.randn(self.in_n_capsules, BilinearOutImg_size * BilinearOutImg_size, self.hidden_dim))
 
         else:
             # Correct this
-            self.E_proj = nn.Parameter(0.02*torch.randn(self.actual_capstypes, self.in_d_capsules, 
+            self.E_proj = nn.Parameter(0.02*torch.randn(self.in_n_capsules, self.in_d_capsules, 
                                     BilinearOutImg_size, BilinearOutImg_size))
   
+
+        
+        # Positional embedding
+        # (256, 49)
+        self.rel_embedd = nn.Parameter(torch.randn(self.in_d_capsules, self.h_out * self.h_out), requires_grad=True)
 
         self.dropout_rate = dp
         self.nonlinear_act = nn.LayerNorm(out_d_capsules)
@@ -212,7 +207,7 @@ class BilinearLinformerCapsuleFC(nn.Module):
         # current_pose shape: (b, num_Capsules, height, width, caps_dim), eg (b,32,16,16,256)
         h_out=self.h_out
         w_out=h_out
-        
+        rel_embedd = self.rel_embedd
         input_height, input_width = current_pose.shape[2], current_pose.shape[3]
         batch_size = current_pose.shape[0]
         pose_dim=self.in_d_capsules
@@ -231,12 +226,13 @@ class BilinearLinformerCapsuleFC(nn.Module):
             # (a*b, hidden_dim) --> 
             E_proj = self.E_proj
             # E_proj=E_proj.unsqueeze(0) 
-            # Current pose becomes (b,256,32,a*b) 
-            current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules,self.actual_capstypes,current_pose.shape[2] * current_pose.shape[3] )
+            # Current pose becomes (b,256,32,1,a*b) 
+            current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules,self.in_n_capsules,1, current_pose.shape[2] * current_pose.shape[3] )
                 
-            # k_val - (b,32,256,hidden dim)
+            # current_pose - (b,256,32,1,a*b), E_proj  = (32,a*b,48) 
             # print(current_pose.shape, E_proj.shape)
-            k_val = torch.matmul(current_pose, E_proj)
+            # (b,256,32,1,48) --> (b,256,32,48)
+            k_val = torch.matmul(current_pose, E_proj).squeeze()
             # reshaped to (b,256, hidden_dim*32)
             k_val = k_val.reshape(current_pose.shape[0], pose_dim, -1)
             k_val = k_val.permute(0,2,1)
@@ -250,10 +246,26 @@ class BilinearLinformerCapsuleFC(nn.Module):
             transposed = torch.transpose(current_pose, 1, 2)
             k_val = self.E_proj(transposed)
             k_val = k_val.permute(0,2,1)
+            # shape: (b, new_num_capsules, caps_dim)
             new_n_capsules = int(k_val.shape[1])
 
 
-        # shape: (b, new_num_capsules, caps_dim)
+        # adding positional embedding to keys
+        #(1,49,256) concatenate to (b,48,256)
+        rel_embedd =rel_embedd.repeat(k_val.shape[0],1,1).permute(0,2,1)
+        # print(rel_embedd.shape)
+        k_val = torch.cat((k_val, rel_embedd),dim=1)
+        # chcj = len(k_val.tolist())
+        # print(chcj)
+        # chcj.append(rel_embedd.permute(1,0))
+        # k_val = torch.FloatTensor(chcj)
+        # # k_val = torch.cat((k_val, pos_embedd),dim=1)
+        # print("New key: ", k_val.shape)
+        new_n_capsules = k_val.shape[1]
+
+
+
+        
         
         # print('Perm shape: ', k_val.shape," ", v_val.shape)
         
@@ -283,9 +295,21 @@ class BilinearLinformerCapsuleFC(nn.Module):
             next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules * next_pose.shape[2] * next_pose.shape[3], self.out_d_capsules)
 
             dots = torch.einsum('bje,bie->bji', next_pose, k_val) * (pose_dim ** -0.5) 
+
+            ############# Relative positional embeddings
+            # #(b,m,256,h_out * w_out ; rel_embedd = (256, h_out * w_out)
+            # next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules,  self.out_d_capsules, h_out * w_out )
+            
+            # # rel_embedd = rel_embedd.
+            # print(next_pose.shape, rel_embedd.shape)
+            # dots_positional = torch.matmul(next_pose, rel_embedd)
+            # dots+=dots_positional
+            # next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules * h_out * w_out, self.out_d_capsules)
+            # print("hello")
+            #############
+            
             dots = dots.softmax(dim=-2) 
             next_pose = torch.einsum('bji,bie->bje', dots, k_val)
-            # (b, m*a*b, out_caps_dim) --> (b, m*out_dim, a, b)
             next_pose= next_pose.reshape(next_pose.shape[0],self.out_n_capsules * pose_dim,h_out,w_out)
             next_pose = self.next_grouped_conv(next_pose)
 
