@@ -21,6 +21,7 @@ class CapsBilinearLinformerModel(nn.Module):
         
         super(CapsBilinearLinformerModel, self).__init__()
         #### Parameters
+
         self.sequential_routing = sequential_routing
         
         ## Primary Capsule Layer
@@ -91,20 +92,23 @@ class CapsBilinearLinformerModel(nn.Module):
             elif params['capsules'][i]['type'] == 'FC':
                 if i == 0:
                     # When there is no Conv layer after primary capsules
-                    in_n_caps = params['primary_capsules']['num_caps'] * params['primary_capsules']['out_img_size'] *\
-                                                                                            params['primary_capsules']['out_img_size']
+                    # in_n_caps = params['primary_capsules']['num_caps'] * params['primary_capsules']['out_img_size'] *\
+                    #                                                                         params['primary_capsules']['out_img_size']
+                    
+                    in_n_caps = params['primary_capsules']['num_caps']
                     in_d_caps = params['primary_capsules']['caps_dim']
                     input_size = params['primary_capsules']['out_img_size']
                 
                 elif params['capsules'][i-1]['type'] == 'FC':
                     in_n_caps = params['capsules'][i-1]['num_caps']
                     in_d_caps = params['capsules'][i-1]['caps_dim'] 
-                    input_size = 1                                          
+                    input_size = params['capsules'][i-1]['h_out']                                           
                 
                 elif params['capsules'][i-1]['type'] == 'CONV':
                     # There are a total of 14X14X32 capsule outputs, each being 16 dimensional 
-                    in_n_caps = params['capsules'][i-1]['num_caps'] * params['capsules'][i-1]['out_img_size'] *\
-                                                                                           params['capsules'][i-1]['out_img_size']  
+                    # in_n_caps = params['capsules'][i-1]['num_caps'] * params['capsules'][i-1]['out_img_size'] *\
+                    #                                                                        params['capsules'][i-1]['out_img_size']  
+                    in_n_caps = params['capsules'][i-1]['num_caps']
                     in_d_caps = params['capsules'][i-1]['caps_dim']
                     input_size = params['capsules'][i-1]['out_img_size']
                 self.capsule_layers.append(
@@ -114,10 +118,13 @@ class CapsBilinearLinformerModel(nn.Module):
                           in_d_capsules=in_d_caps, 
                           out_n_capsules=params['capsules'][i]['num_caps'], 
                           out_d_capsules=params['capsules'][i]['caps_dim'], 
-                          kernel_size=params['capsules'][i]['kernel_size'],
-                          stride=params['capsules'][i]['stride'],
-                          padding=params['capsules'][i]['padding'],
-                          group_size = params['capsules'][i]['group_size'],
+                          h_out = params['capsules'][i]['h_out'],
+                          child_kernel_size=params['capsules'][i]['child_kernel_size'],
+                          child_stride=params['capsules'][i]['child_stride'],
+                          child_padding=params['capsules'][i]['child_padding'],
+                          parent_kernel_size=params['capsules'][i]['parent_kernel_size'],
+                          parent_stride=params['capsules'][i]['parent_stride'],
+                          parent_padding=params['capsules'][i]['parent_padding'],
                           parameter_sharing = params['capsules'][i]['parameter_sharing'],
                           matrix_pose=params['capsules'][i]['matrix_pose'],
                           dp=dp
@@ -129,16 +136,18 @@ class CapsBilinearLinformerModel(nn.Module):
             if params['capsules'][-1]['type'] == 'FC':
                 in_n_caps = params['capsules'][-1]['num_caps']
                 in_d_caps = params['capsules'][-1]['caps_dim']
-                input_size=1
+                input_size=params['capsules'][-1]['h_out']
 
             elif params['capsules'][-1]['type'] == 'CONV':    
-                in_n_caps = params['capsules'][-1]['num_caps'] * params['capsules'][-1]['out_img_size'] *\
-                                                                                   params['capsules'][-1]['out_img_size']
+                # in_n_caps = params['capsules'][-1]['num_caps'] * params['capsules'][-1]['out_img_size'] *\
+                #                                                                    params['capsules'][-1]['out_img_size']
+                in_n_caps = params['capsules'][-1]['num_caps']
                 in_d_caps = params['capsules'][-1]['caps_dim']
                 input_size = params['capsules'][i-1]['out_img_size']
         else:
-            in_n_caps = params['primary_capsules']['num_caps'] * params['primary_capsules']['out_img_size'] *\
-                                                                               params['primary_capsules']['out_img_size']
+            # in_n_caps = params['primary_capsules']['num_caps'] * params['primary_capsules']['out_img_size'] *\
+            #                                                                    params['primary_capsules']['out_img_size']
+            in_n_caps = params['primary_capsules']['num_caps']
             in_d_caps = params['primary_capsules']['caps_dim']
             input_size = params['primary_capsules']['out_img_size']
         
@@ -149,10 +158,13 @@ class CapsBilinearLinformerModel(nn.Module):
                     in_d_capsules=in_d_caps, 
                     out_n_capsules=params['class_capsules']['num_caps'], 
                     out_d_capsules=params['class_capsules']['caps_dim'], 
-                    kernel_size=params['class_capsules']['kernel_size'],
-                    stride=params['class_capsules']['stride'],
-                    padding=params['class_capsules']['padding'],
-                    group_size = params['class_capsules']['group_size'],
+                    h_out = params['class_capsules']['h_out'],
+                    child_kernel_size=params['capsules'][i]['child_kernel_size'],
+                    child_stride=params['capsules'][i]['child_stride'],
+                    child_padding=params['capsules'][i]['child_padding'],
+                    parent_kernel_size=params['capsules'][i]['parent_kernel_size'],
+                    parent_stride=params['capsules'][i]['parent_stride'],
+                    parent_padding=params['capsules'][i]['parent_padding'],
                     parameter_sharing = params['class_capsules']['parameter_sharing'],
                     matrix_pose=params['class_capsules']['matrix_pose'],
                     dp=dp
@@ -189,17 +201,19 @@ class CapsBilinearLinformerModel(nn.Module):
             # perform initilialization for the capsule values as single forward passing
             capsule_values, _val = [init_capsule_value], init_capsule_value
             for i in range(len(self.capsule_layers)):
-                _val = self.capsule_layers[i].forward(_val, 0)
-                capsule_values.append(_val) # get the capsule value for next layer
+              # print("I is", i)
+              _val = self.capsule_layers[i].forward(_val, 0)
+              capsule_values.append(_val) # get the capsule value for next layer
             
             # second to t iterations
             # perform the routing between capsule layers
             for n in range(self.num_routing-1):
                 _capsule_values = [init_capsule_value]
                 for i in range(len(self.capsule_layers)):
-                    _val = self.capsule_layers[i].forward(capsule_values[i], n, 
-                                    capsule_values[i+1])
-                    _capsule_values.append(_val)
+                  # print("I is", i)
+                  _val = self.capsule_layers[i].forward(capsule_values[i], n, 
+                                  capsule_values[i+1])
+                  _capsule_values.append(_val)
                 capsule_values = _capsule_values
         
 
