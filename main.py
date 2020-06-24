@@ -36,7 +36,7 @@ parser = argparse.ArgumentParser(description='Training Capsules using Inverted D
 
 parser.add_argument('--resume_dir', '-r', default='', type=str, help='dir where we resume from checkpoint')
 parser.add_argument('--num_routing', default=2, type=int, help='number of routing. Recommended: 0,1,2,3.')
-parser.add_argument('--dataset', default='CIFAR100', type=str, help='dataset. CIFAR10,CIFAR100 or MNIST')
+parser.add_argument('--dataset', default='CIFAR10', type=str, help='dataset. CIFAR10,CIFAR100 or MNIST')
 parser.add_argument('--backbone', default='resnet', type=str, help='type of backbone. simple or resnet')
 parser.add_argument('--num_workers', default=2, type=int, help='number of workers. 0 or 2')
 parser.add_argument('--config_path', default='./configs/resnet_backbone_CIFAR100_capsdim1024.json', type=str, help='path of the config')
@@ -52,7 +52,7 @@ parser.add_argument('--gamma', default=0.1, type=float, help='learning rate deca
 parser.add_argument('--dp', default=0.0, type=float, help='dropout rate')
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='weight decay')
 parser.add_argument('--total_epochs', default=400, type=int, help='Total epochs for training')
-parser.add_argument('--model', default='linformer', type=str, help='linformer')
+parser.add_argument('--model', default='linformerUnfold', type=str, help='linformer,bilinear')
 parser.add_argument('--optimizer', default='SGD', type=str, help='SGD or Adams')
 
 # parser.add_argument('--save_dir', default='CIFAR10', type=str, help='dir to save results')
@@ -84,8 +84,17 @@ print('==> Building model..')
 with open(args.config_path, 'rb') as file:
     params = json.load(file)
 
-if args.model=='linformer':
-    net = capsule_model.CapsBilinearLinformerModel(image_dim_size,
+if args.model=='linformerUnfold':
+    net = capsule_model.CapsBilinearLinformerUnfoldModel(image_dim_size,
+                        params,
+                        args.dataset,
+                        args.backbone,
+                        args.dp,
+                        args.num_routing,
+                        sequential_routing=args.sequential_routing)
+
+if args.model=='bilinear':
+    net = capsule_model.CapsBAModel(image_dim_size,
                         params,
                         args.dataset,
                         args.backbone,

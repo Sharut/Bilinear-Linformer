@@ -13,6 +13,9 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+from .bilinear_sparse_routing import BilinearSparseRouting, BilinearRouting, DynamicBilinearRouting
+from .linformer import LinformerProjectionKernel, BilinearProjectionWithEmbeddings
+
 #### Simple Backbone ####
 class simple_backbone(nn.Module):
     def __init__(self, cl_input_channels,cl_num_filters,cl_filter_size, 
@@ -122,75 +125,73 @@ class resnet_backbone_imagenet(nn.Module):
         return out 
 
 
-def get_EF(input_size, dim):
-    """
-    Retuns the E or F matrix, initialized via xavier initialization.
-    """
-    EF = nn.Linear(input_size, dim)
-    torch.nn.init.xavier_normal_(EF.weight)
-    return EF
+###
+# Explained einsum
+
+'''
+
+https://stackoverflow.com/questions/26089893/understanding-numpys-einsum
+
+torch.einsum('i,ij->i', A, B)
+
+    1. A has one axis; we've labelled it i. And B has two axes; 
+    we've labelled axis 0 as i and axis 1 as j.
+    2. By repeating the label i in both input arrays, we are telling 
+    einsum that these two axes should be multiplied together. 
+    In other words, we're multiplying array A with each column of array B, 
+    just like A[:, np.newaxis] * B does.
+    3. Notice that j does not appear as a label in our desired output; 
+    we've just used i (we want to end up with a 1D array). 
+    By omitting the label, we're telling einsum to sum along this axis. 
+    In other words, we're summing the rows of the products, just like .sum(axis=1) does.
+
+
+'''
 
 
 
 
-#### Bilinear Linformer Capsule Layer ####
-class BilinearLinformerCapsuleFC(nn.Module):
+
+
+
+
+#### Capsule Layer ####
+class CapsuleFC(nn.Module):
     r"""Applies as a capsule fully-connected layer.
     TBD
     """
+    
+    '''
+    Same as CapsuleConv
+    except that kernal size=1 everywhere. 
+    '''
 
-    def __init__(self, hidden_dim, input_size, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, h_out, child_kernel_size, child_stride, child_padding, parent_kernel_size, parent_stride, parent_padding, parameter_sharing, matrix_pose, dp):
-
-        super(BilinearLinformerCapsuleFC, self).__init__()
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, matrix_pose, dp):
+        super(CapsuleFC, self).__init__()
         self.in_n_capsules = in_n_capsules
         self.in_d_capsules = in_d_capsules
         self.out_n_capsules = out_n_capsules
         self.out_d_capsules = out_d_capsules
-        self.h_out=h_out
         self.matrix_pose = matrix_pose
-        self.hidden_dim =hidden_dim
-        self.parameter_sharing=parameter_sharing
         
+        # Matrix form of Hilton
+        if matrix_pose:
+            self.sqrt_d = int(np.sqrt(self.in_d_capsules))
+            self.weight_init_const = np.sqrt(out_n_capsules/(self.sqrt_d*in_n_capsules)) 
+            self.w = nn.Parameter(self.weight_init_const* \
+                                          torch.randn(in_n_capsules, self.sqrt_d, self.sqrt_d, out_n_capsules))
         
-        self.current_grouped_conv = nn.Conv2d(in_channels=self.in_n_capsules*in_d_capsules,
-                                     out_channels=self.in_n_capsules*in_d_capsules,
-                                     kernel_size=child_kernel_size,
-                                     stride=child_stride,
-                                     padding=child_padding,
-                                     groups=self.in_n_capsules,
-                                     bias=False)
-
-        self.next_grouped_conv = nn.Conv2d(in_channels=out_n_capsules*out_d_capsules,
-                                     out_channels=out_n_capsules*out_d_capsules,
-                                     kernel_size= parent_kernel_size ,
-                                     stride=parent_stride,
-                                     padding=parent_padding,
-                                     groups=self.in_n_capsules,
-                                     bias=False)
-        
-        
-        BilinearOutImg_size = int((input_size - child_kernel_size + 2* child_padding)/child_stride)+1
-            
-        if parameter_sharing == "headwise":
-            self.E_proj = nn.Parameter(0.02*torch.randn(self.in_n_capsules, BilinearOutImg_size * BilinearOutImg_size, self.hidden_dim))
-
+        # Vector form of Hilton  
         else:
-            # Correct this
-            self.E_proj = nn.Parameter(0.02*torch.randn(self.in_n_capsules, self.in_d_capsules, 
-                                    BilinearOutImg_size, BilinearOutImg_size))
-  
+            self.weight_init_const = np.sqrt(out_n_capsules/(in_d_capsules*in_n_capsules)) 
+            self.w = nn.Parameter(self.weight_init_const* \
+                                          torch.randn(in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules))
 
-        
-        # Positional embedding
-        # (256, 49)
-        self.rel_embedd = nn.Parameter(torch.randn(self.in_d_capsules, self.h_out * self.h_out), requires_grad=True)
 
         self.dropout_rate = dp
         self.nonlinear_act = nn.LayerNorm(out_d_capsules)
         self.drop = nn.Dropout(self.dropout_rate)
         self.scale = 1. / (out_d_capsules ** 0.5)
-
-    
 
     def extra_repr(self):
         return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, matrix_pose={}, \
@@ -198,137 +199,582 @@ class BilinearLinformerCapsuleFC(nn.Module):
             self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, self.matrix_pose,
             self.weight_init_const, self.dropout_rate
         )        
-    def forward(self, current_pose, num_iter, next_pose = None):
+    def forward(self, input, num_iter, next_capsule_value=None):
         # b: batch size
         # n: num of capsules in current layer
         # a: dim of capsules in current layer
         # m: num of capsules in next layer
         # d: dim of capsules in next layer
-        # current_pose shape: (b, num_Capsules, height, width, caps_dim), eg (b,32,16,16,256)
-        h_out=self.h_out
-        w_out=h_out
-        rel_embedd = self.rel_embedd
-        input_height, input_width = current_pose.shape[2], current_pose.shape[3]
-        batch_size = current_pose.shape[0]
-        pose_dim=self.in_d_capsules
-        
-        # Applying grouped convolution across capsule dimension
-        if len(current_pose.shape) == 5:
-            current_pose = current_pose.permute(0,2,3,1,4)
-            current_pose = current_pose.contiguous().view(current_pose.shape[0], current_pose.shape[1], current_pose.shape[2],-1)
-            current_pose = current_pose.permute(0,3,1,2)
+        if len(input.shape) == 5:
+            input = input.permute(0, 4, 1, 2, 3)
+            input = input.contiguous().view(input.shape[0], input.shape[1], -1)
+            input = input.permute(0,2,1)
 
-        # current_pose : (b, 32*256, 16, 16) --> (b, 32*256, a, b) --> (b,32*a*b,256) == (b,n,d) in sequences
-        # Check this once, Group size = num_caps
-        current_pose = self.current_grouped_conv(current_pose)
-        
-        if self.parameter_sharing == 'headwise':
-            # (a*b, hidden_dim) --> 
-            E_proj = self.E_proj
-            # E_proj=E_proj.unsqueeze(0) 
-            # Current pose becomes (b,256,32,1,a*b) 
-            current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules,self.in_n_capsules,1, current_pose.shape[2] * current_pose.shape[3] )
-                
-            # current_pose - (b,256,32,1,a*b), E_proj  = (32,a*b,48) 
-            # print(current_pose.shape, E_proj.shape)
-            # (b,256,32,1,48) --> (b,256,32,48)
-            k_val = torch.matmul(current_pose, E_proj).squeeze()
-            # reshaped to (b,256, hidden_dim*32)
-            k_val = k_val.reshape(current_pose.shape[0], pose_dim, -1)
-            k_val = k_val.permute(0,2,1)
-            # print("Shape of k val is", k_val.shape)
-            new_n_capsules = k_val.shape[1]
-
+        if self.matrix_pose:
+            w = self.w # nxdm
+            _input = input.view(input.shape[0], input.shape[1], self.sqrt_d, self.sqrt_d) # bnax
         else:
-            # Correct this
-            current_pose = current_pose.reshape(current_pose.shape[0], self.in_d_capsules, -1)
-            current_pose = current_pose.permute(0,2,1)        
-            transposed = torch.transpose(current_pose, 1, 2)
-            k_val = self.E_proj(transposed)
-            k_val = k_val.permute(0,2,1)
-            # shape: (b, new_num_capsules, caps_dim)
-            new_n_capsules = int(k_val.shape[1])
-
-
-        # adding positional embedding to keys
-        #(1,49,256) concatenate to (b,48,256)
-        rel_embedd =rel_embedd.repeat(k_val.shape[0],1,1).permute(0,2,1)
-        # print(rel_embedd.shape)
-        k_val = torch.cat((k_val, rel_embedd),dim=1)
-        # chcj = len(k_val.tolist())
-        # print(chcj)
-        # chcj.append(rel_embedd.permute(1,0))
-        # k_val = torch.FloatTensor(chcj)
-        # # k_val = torch.cat((k_val, pos_embedd),dim=1)
-        # print("New key: ", k_val.shape)
-        new_n_capsules = k_val.shape[1]
-
-
-
-        
-        
-        # print('Perm shape: ', k_val.shape," ", v_val.shape)
-        
-        if next_pose is None:
-            # print(batch_size,self.out_n_capsules,  pose_dim)
-            dots = (torch.ones(batch_size, self.out_n_capsules*h_out*w_out, new_n_capsules)* (pose_dim ** -0.5)).type_as(k_val).to(k_val)
-            dots = F.softmax(dots, dim=-2)
-            # print(dots.shape, k_val.shape)
-            # output shape: b, out_caps, caps_dim
+            w = self.w
             
-            next_pose = torch.einsum('bji,bie->bje', dots, k_val)
-            next_pose= next_pose.reshape(next_pose.shape[0],self.out_n_capsules * pose_dim,h_out,w_out)
-            next_pose = self.next_grouped_conv(next_pose)
-        
-            next_pose =next_pose.reshape(batch_size, self.out_n_capsules, h_out, w_out, pose_dim)
-            return next_pose
+
+        if next_capsule_value is None:
+            # next_capsule_vale=None at 1st Iteration
+            # query key == r_{i,j} (routing probabilities)
+            query_key = torch.zeros(self.in_n_capsules, self.out_n_capsules).type_as(input)
+            query_key = F.softmax(query_key, dim=1)
+
+            if self.matrix_pose:
+                # Einsum: computing multilinear expressions (i.e. sums of products) using the Einstein summation convention.
+                next_capsule_value = torch.einsum('nm, bnax, nxdm->bmad', query_key, _input, w)
+            else:
+                next_capsule_value = torch.einsum('nm, bna, namd->bmd', query_key, input, w)
         else:
-            # next pose: (b,m,h_out,w_out,out_caps_dim) --> (b, m*out_cap_dim, h_out, w_out)
-            h_out = next_pose.shape[2]
-            w_out = next_pose.shape[3]
-            next_pose = next_pose.permute(0,2,3,1,4)
-            next_pose = next_pose.contiguous().view(next_pose.shape[0], next_pose.shape[1], next_pose.shape[2],-1)
-            next_pose = next_pose.permute(0,3,1,2)
-            next_pose = self.next_grouped_conv(next_pose)
-
-            # (b, m*out_cap_dim, a, b) --> (b, m*a*b, out_caps_dim)
-            next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules * next_pose.shape[2] * next_pose.shape[3], self.out_d_capsules)
-
-            dots = torch.einsum('bje,bie->bji', next_pose, k_val) * (pose_dim ** -0.5) 
-
-            ############# Relative positional embeddings
-            # #(b,m,256,h_out * w_out ; rel_embedd = (256, h_out * w_out)
-            # next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules,  self.out_d_capsules, h_out * w_out )
+            if self.matrix_pose:
+                next_capsule_value = next_capsule_value.view(next_capsule_value.shape[0], 
+                                       next_capsule_value.shape[1], self.sqrt_d, self.sqrt_d)
+                # _query_key == agreement vector ( a_{i,j})
+                _query_key = torch.einsum('bnax, nxdm, bmad->bnm', _input, w, next_capsule_value)
+            else:
+                _query_key = torch.einsum('bna, namd, bmd->bnm', input, w, next_capsule_value)
             
-            # # rel_embedd = rel_embedd.
-            # print(next_pose.shape, rel_embedd.shape)
-            # dots_positional = torch.matmul(next_pose, rel_embedd)
-            # dots+=dots_positional
-            # next_pose = next_pose.reshape(next_pose.shape[0], self.out_n_capsules * h_out * w_out, self.out_d_capsules)
-            # print("hello")
-            #############
+
+            # New routing probabilities
+            _query_key.mul_(self.scale)
+            query_key = F.softmax(_query_key, dim=2)
+            query_key = query_key / (torch.sum(query_key, dim=2, keepdim=True) + 1e-10)
             
-            dots = dots.softmax(dim=-2) 
-            next_pose = torch.einsum('bji,bie->bje', dots, k_val)
-            next_pose= next_pose.reshape(next_pose.shape[0],self.out_n_capsules * pose_dim,h_out,w_out)
-            next_pose = self.next_grouped_conv(next_pose)
-
-            # (b, m , a, b, out_caps_dim)
-            next_pose =next_pose.reshape(batch_size, self.out_n_capsules, h_out, w_out, pose_dim)
-
+            if self.matrix_pose:
+                # Use new routing values, to update state of parent capsule
+                next_capsule_value = torch.einsum('bnm, bnax, nxdm->bmad', query_key, _input, 
+                                                  w)
+            else:
+                next_capsule_value = torch.einsum('bnm, bna, namd->bmd', query_key, input, 
+                                                  w)
 
         # Apply dropout
-        next_pose = self.drop(next_pose)
-        if not next_pose.shape[-1] == 1:
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
             if self.matrix_pose:
-                next_pose = next_pose.view(next_pose.shape[0], 
-                                       next_pose.shape[1], self.out_d_capsules)
-                next_pose = self.nonlinear_act(next_pose)
+                next_capsule_value = next_capsule_value.view(next_capsule_value.shape[0], 
+                                       next_capsule_value.shape[1], self.out_d_capsules)
+                # Apply layer Norm
+                next_capsule_value = self.nonlinear_act(next_capsule_value)
             else:
-                next_pose = self.nonlinear_act(next_pose)
-        return next_pose
+                next_capsule_value = self.nonlinear_act(next_capsule_value)
+        return next_capsule_value
 
 
 # 
+class CapsuleCONV(nn.Module):
+    r"""Applies as a capsule convolutional layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, 
+                 kernel_size, stride, matrix_pose, dp, coordinate_add=False):
+        super(CapsuleCONV, self).__init__()
+        self.in_n_capsules = in_n_capsules
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.matrix_pose = matrix_pose
+        self.coordinate_add = coordinate_add
+        
+        if matrix_pose:
+            self.sqrt_d = int(np.sqrt(self.in_d_capsules))
+            self.weight_init_const = np.sqrt(out_n_capsules/(self.sqrt_d*in_n_capsules*kernel_size*kernel_size)) 
+            self.w = nn.Parameter(self.weight_init_const*torch.randn(kernel_size, kernel_size,
+                                                     in_n_capsules, self.sqrt_d, self.sqrt_d, out_n_capsules))
+
+        else:
+            self.weight_init_const = np.sqrt(out_n_capsules/(in_d_capsules*in_n_capsules*kernel_size*kernel_size)) 
+            self.w = nn.Parameter(self.weight_init_const*torch.randn(kernel_size, kernel_size,
+                                                     in_n_capsules, in_d_capsules, out_n_capsules, 
+                                                     out_d_capsules))
+        
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.dropout_rate = dp
+        self.drop = nn.Dropout(self.dropout_rate)
+        self.scale = 1. / (out_d_capsules ** 0.5)
+
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, \
+                    kernel_size={}, stride={}, coordinate_add={}, matrix_pose={}, weight_init_const={}, \
+                    dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, 
+            self.kernel_size, self.stride, self.coordinate_add, self.matrix_pose, self.weight_init_const,
+            self.dropout_rate
+            )        
+    def input_expansion(self, input):
+        # input has size [batch x num_of_capsule x height x width x capsule_dimension]
+        
+        # unfold(dimension, size, step) → Tensor: Unfold Extracts sliding local blocks along given dim
+        # extracts kernel patches over complete height and width
+        unfolded_input = input.unfold(2,size=self.kernel_size,step=self.stride).unfold(3,size=self.kernel_size,step=self.stride)
+        unfolded_input = unfolded_input.permute([0,1,5,6,2,3,4])
+        # output has size [batch x num_of_capsule x kernel_size x kernel_size x h_out x w_out x capsule_dimension]
+        return unfolded_input
+    
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # k,l: kernel size
+        # h,w: output width and length 
+        # b: batch size
+        # n: num of capsules in current layer
+        # a: dim of capsules in current layer
+        # m: num of capsules in next layer
+        # d: dim of capsules in next layer
+
+        # This converts (b,32,14,14,16) --> (b,32,3,3,7,7,16) (3X3 patches, 7 in number along both height and width)
+        inputs = self.input_expansion(input)
+
+        # print("Expansion: ",input.shape, inputs.shape)
+
+        if self.matrix_pose:
+            # W is pose of capsules of layer L
+            # Input is capsule of layer L (p_{L})
+            w = self.w # klnxdm
+
+            # Converts (b,32,3,3,7,7,16) --> (b,32,3,3,7,7,4,4)
+            _inputs = inputs.view(inputs.shape[0], inputs.shape[1], inputs.shape[2], inputs.shape[3],\
+                                  inputs.shape[4], inputs.shape[5], self.sqrt_d, self.sqrt_d) # bnklmhax
+            # print(_inputs.shape)
+
+        else:
+            w = self.w
+            
+        if next_capsule_value is None:
+            # Routing probabilities in 1st iteration
+
+            query_key = torch.zeros(self.in_n_capsules, self.kernel_size, self.kernel_size, 
+                                                self.out_n_capsules).type_as(inputs) # nklm
+            
+            query_key = F.softmax(query_key, dim=3) # softmax on output number of capsules
+            # print("Query :",query_key.shape)
+            # print("w :",w.shape)
+            # print("input :",_inputs.shape)
+            
+
+            if self.matrix_pose:
+                # a,x are sqrt_d if matrix pose and not vector pose
+                # This performs convolution as well and attention both 
+
+                # next capsule shape is (b,32,7,7,16) just like original input 
+                '''
+                
+
+                for all b:
+                    for all m:
+                        for all h:
+                            for all w:
+                                for all a:
+                                    for all d:
+                                        for all n: (summing over capsules of layer L)
+                                            for all k: 
+                                                for all l: (over all patches)
+                                                    multiply input pose [(a,x)==(4,4)] with w [(x,d)==(4,4)] 
+                '''
+                next_capsule_value = torch.einsum('nklm, bnklhwax, klnxdm->bmhwad', query_key, 
+                                              _inputs, w)
+            
+
+            else:
+                # Vectorised implementation
+                next_capsule_value = torch.einsum('nklm, bnklhwa, klnamd->bmhwd', query_key, 
+                                              inputs, w)
+        else:
+            if self.matrix_pose:
+                # break 16 to (4,4) pose
+                next_capsule_value = next_capsule_value.view(next_capsule_value.shape[0],\
+                                         next_capsule_value.shape[1], next_capsule_value.shape[2],\
+                                         next_capsule_value.shape[3], self.sqrt_d, self.sqrt_d)
+                
+                # w=(3,3,32,4,4,m), _input=(b,32,3,3,7,7,4,4) , next_capsule_value= (b,m,7,7,4,4)
+                _query_key = torch.einsum('bnklhwax, klnxdm, bmhwad->bnklmhw', _inputs, w, 
+                                     next_capsule_value)
+
+            else:    
+                _query_key = torch.einsum('bnklhwa, klnamd, bmhwd->bnklmhw', inputs, w, 
+                                     next_capsule_value)
+            
+            # Compute new routing probabilities
+            _query_key.mul_(self.scale)
+            query_key = F.softmax(_query_key, dim=4)
+            query_key = query_key / (torch.sum(query_key, dim=4, keepdim=True) + 1e-10)
+            
+            if self.matrix_pose:
+                # Update parent parent using new routing probabilties
+                next_capsule_value = torch.einsum('bnklmhw, bnklhwax, klnxdm->bmhwad', query_key, 
+                                              _inputs, w)
+                # print("others iter : ", next_capsule_value.shape)    
+            else:
+                next_capsule_value = torch.einsum('bnklmhw, bnklhwa, klnamd->bmhwd', query_key, 
+                                              inputs, w)     
+        
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            if self.matrix_pose:
+                # Correct size of parent capsule
+                next_capsule_value = next_capsule_value.view(next_capsule_value.shape[0],\
+                                         next_capsule_value.shape[1], next_capsule_value.shape[2],\
+                                         next_capsule_value.shape[3], self.out_d_capsules)
+                # Layer Norm 
+                next_capsule_value = self.nonlinear_act(next_capsule_value)
+            else:
+                next_capsule_value = self.nonlinear_act(next_capsule_value)
+                
+        return next_capsule_value
+
+
+
+
+#### Capsule Layers with the proposed bilinear sparse routing ####
+class SACapsuleFC(nn.Module):
+    r"""Applies as a capsule fully-connected layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, matrix_pose, dp):
+        super(SACapsuleFC, self).__init__()
+        self.in_n_capsules = in_n_capsules # This is n_caps * h_in * w_in
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.matrix_pose = matrix_pose
+        self.dropout_rate = dp
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.drop = nn.Dropout(self.dropout_rate)
+        self.scale = 1. / (out_d_capsules ** 0.5)
+
+        self.sinhkorn_caps_attn = BilinearSparseRouting(next_bucket_size=self.out_n_capsules, in_n_capsules=in_n_capsules, in_d_capsules=in_d_capsules, out_n_capsules=out_n_capsules, 
+                                                     out_d_capsules=out_d_capsules, matrix_pose=self.matrix_pose, layer_type='FC', kernel_size=1,
+                                                     temperature = 0.75,
+                                                    non_permutative = True, sinkhorn_iter = 7, n_sortcut = 2, dropout = 0., current_bucket_size = self.in_n_capsules//8,
+                                                    use_simple_sort_net = False)
+
+    
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, matrix_pose={}, \
+            dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, self.matrix_pose,
+            self.dropout_rate
+        )        
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # b: batch size
+        # n: num of capsules in current layer
+        # a: dim of capsules in current layer
+        # m: num of capsules in next layer
+        # d: dim of capsules in next layer
+        print("Input ", input.shape)
+        if len(input.shape) == 5:
+            input = input.permute(0, 4, 1, 2, 3)
+            input = input.contiguous().view(input.shape[0], input.shape[1], -1)
+            input = input.permute(0,2,1)
+
+        print("Transformed ", input.shape)
+        batch_size = input.shape[0]
+        next_capsule_value = self.sinhkorn_caps_attn(current_pose=input, h_out=1, w_out=1, next_pose=next_capsule_value)
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            next_capsule_value = self.nonlinear_act(next_capsule_value)
+        return next_capsule_value
+
+class SACapsuleCONV(nn.Module):
+    r"""Applies as a capsule convolutional layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, 
+                 kernel_size, stride, matrix_pose, dp, padding=None, coordinate_add=False):
+        super(SACapsuleCONV, self).__init__()
+        self.in_n_capsules = in_n_capsules
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.matrix_pose = matrix_pose
+        self.coordinate_add = coordinate_add
+        self.padding = padding
+        
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.dropout_rate = dp
+        self.drop = nn.Dropout(self.dropout_rate)
+
+        self.sinhkorn_caps_attn = BilinearSparseRouting(next_bucket_size=self.out_n_capsules, in_n_capsules=in_n_capsules, in_d_capsules=in_d_capsules, out_n_capsules=out_n_capsules, 
+                                                     out_d_capsules=out_d_capsules, matrix_pose=self.matrix_pose, layer_type='conv', kernel_size=kernel_size,
+                                                     temperature = 0.75,
+                                                        non_permutative = True, sinkhorn_iter = 7, n_sortcut = 1, dropout = 0., current_bucket_size = self.in_n_capsules,
+                                                        use_simple_sort_net = False)
+
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, \
+                    kernel_size={}, stride={}, coordinate_add={}, matrix_pose={},  \
+                    dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, 
+            self.kernel_size, self.stride, self.coordinate_add, self.matrix_pose, 
+            self.dropout_rate
+            )       
+             
+    def input_expansion(self, input):
+        # input has size [batch x num_of_capsule x height x width x  x capsule_dimension]
+        if self.padding:
+            input = input.permute([0,1,4,2,3]) #For padding h,w
+            if not self.padding%1:
+                input = F.pad(input, [self.padding, self.padding, self.padding, self.padding]) #TODO: Padding to maintain same size, change so that caps dim not padded
+            else:
+                input = F.pad(input, [math.ceil(self.padding), math.floor(self.padding), math.ceil(self.padding), math.floor(self.padding)]) #TODO: Padding to maintain same size, change so that caps dim not padded
+            input = input.permute([0,1,3,4,2])
+        unfolded_input = input.unfold(2,size=self.kernel_size,step=self.stride).unfold(3,size=self.kernel_size,step=self.stride)
+        unfolded_input = unfolded_input.permute([0,1,5,6,2,3,4])
+        # output has size [batch x num_of_capsule x kernel_size x kernel_size x h_out x w_out x capsule_dimension]
+        return unfolded_input
+    
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # k,l: kernel size
+        # h,w: output width and length 
+        inputs = self.input_expansion(input)
+        batch_size = inputs.shape[0]
+        h_out = inputs.shape[4]
+        w_out = inputs.shape[5] 
+        next_capsule_value = self.sinhkorn_caps_attn(current_pose=inputs, h_out=h_out, w_out=w_out, next_pose=next_capsule_value)
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            next_capsule_value = self.nonlinear_act(next_capsule_value)                
+        return next_capsule_value        
+
+
+
+
+
+
+
+#### Capsule Layers with the proposed bilinear routing without sinkhorn - Ablation study ####
+class BACapsuleFC(nn.Module):
+    r"""Applies as a capsule fully-connected layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, matrix_pose, dp):
+        super(BACapsuleFC, self).__init__()
+        self.in_n_capsules = in_n_capsules
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.matrix_pose = matrix_pose
+        self.dropout_rate = dp
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.drop = nn.Dropout(self.dropout_rate)
+        self.scale = 1. / (out_d_capsules ** 0.5)
+
+        self.bilinear_attn = BilinearRouting(next_bucket_size=self.out_n_capsules, in_n_capsules=in_n_capsules, in_d_capsules=in_d_capsules, out_n_capsules=out_n_capsules, 
+                                                     out_d_capsules=out_d_capsules, matrix_pose=self.matrix_pose, layer_type='FC', kernel_size=1,
+                                                     temperature = 0.75,
+                                                    non_permutative = True, sinkhorn_iter = 7, n_sortcut = 2, dropout = 0., current_bucket_size = self.in_n_capsules//8,
+                                                    use_simple_sort_net = False)
+
+    
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, matrix_pose={}, \
+            dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, self.matrix_pose,
+            self.dropout_rate
+        )        
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # b: batch size
+        # n: num of capsules in current layer
+        # a: dim of capsules in current layer
+        # m: num of capsules in next layer
+        # d: dim of capsules in next layer
+        if len(input.shape) == 5:
+            input = input.permute(0, 4, 1, 2, 3)
+            input = input.contiguous().view(input.shape[0], input.shape[1], -1)
+            input = input.permute(0,2,1)
+
+
+        batch_size = input.shape[0]
+        next_capsule_value = self.bilinear_attn(current_pose=input, h_out=1, w_out=1, next_pose=next_capsule_value)
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            next_capsule_value = self.nonlinear_act(next_capsule_value)
+        return next_capsule_value
+
+class BACapsuleCONV(nn.Module):
+    r"""Applies as a capsule convolutional layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, 
+                 kernel_size, stride, matrix_pose, dp, padding=None, coordinate_add=False):
+        super(BACapsuleCONV, self).__init__()
+        self.in_n_capsules = in_n_capsules
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.matrix_pose = matrix_pose
+        self.coordinate_add = coordinate_add
+        self.padding = padding
+        
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.dropout_rate = dp
+        self.drop = nn.Dropout(self.dropout_rate)
+
+        self.bilinear_attn = BilinearRouting(next_bucket_size=self.out_n_capsules, in_n_capsules=in_n_capsules, in_d_capsules=in_d_capsules, out_n_capsules=out_n_capsules, 
+                                                     out_d_capsules=out_d_capsules, matrix_pose=self.matrix_pose, layer_type='conv', kernel_size=kernel_size,
+                                                     temperature = 0.75,
+                                                        non_permutative = True, sinkhorn_iter = 7, n_sortcut = 1, dropout = 0., current_bucket_size = self.in_n_capsules,
+                                                        use_simple_sort_net = False)
+
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, \
+                    kernel_size={}, stride={}, coordinate_add={}, matrix_pose={},  \
+                    dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, 
+            self.kernel_size, self.stride, self.coordinate_add, self.matrix_pose, 
+            self.dropout_rate
+            )       
+             
+    def input_expansion(self, input):
+        # input has size [batch x num_of_capsule x height x width x  x capsule_dimension]
+        if self.padding:
+            input = input.permute([0,1,4,2,3]) #For padding h,w
+            if not self.padding%1:
+                input = F.pad(input, [self.padding, self.padding, self.padding, self.padding]) #TODO: Padding to maintain same size, change so that caps dim not padded
+            else:
+                input = F.pad(input, [math.ceil(self.padding), math.floor(self.padding), math.ceil(self.padding), math.floor(self.padding)]) #TODO: Padding to maintain same size, change so that caps dim not padded
+            input = input.permute([0,1,3,4,2])
+        unfolded_input = input.unfold(2,size=self.kernel_size,step=self.stride).unfold(3,size=self.kernel_size,step=self.stride)
+        unfolded_input = unfolded_input.permute([0,1,5,6,2,3,4])
+        # output has size [batch x num_of_capsule x kernel_size x kernel_size x h_out x w_out x capsule_dimension]
+        return unfolded_input
+    
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # k,l: kernel size
+        # h,w: output width and length 
+        inputs = self.input_expansion(input)
+        batch_size = inputs.shape[0]
+        h_out = inputs.shape[4]
+        w_out = inputs.shape[5] 
+        next_capsule_value = self.bilinear_attn(current_pose=inputs, h_out=h_out, w_out=w_out, next_pose=next_capsule_value)
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            next_capsule_value = self.nonlinear_act(next_capsule_value)                
+        return next_capsule_value 
+
+
+
+
+
+
+#### Capsule Layers with the linformer projections and unfold operstions
+class LACapsuleFC(nn.Module):
+    r"""Applies as a capsule fully-connected layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, input_img_size, output_img_size, hidden_dim, matrix_pose, dp):
+        super(LACapsuleFC, self).__init__()
+        self.in_n_capsules = in_n_capsules # This is n_caps * h_in * w_in
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.input_img_size = input_img_size
+        self.output_img_size = output_img_size
+        self.matrix_pose = matrix_pose
+        self.dropout_rate = dp
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.drop = nn.Dropout(self.dropout_rate)
+        self.scale = 1. / (out_d_capsules ** 0.5)
+
+        self.linformer_attention = LinformerProjectionKernel(in_n_capsules=in_n_capsules, in_d_capsules=in_d_capsules, out_n_capsules=out_n_capsules, 
+                                                     out_d_capsules=out_d_capsules, matrix_pose=self.matrix_pose, layer_type='FC', input_img_size = input_img_size, output_img_size = output_img_size,
+                                                    hidden_dim = hidden_dim, kernel_size=1, dropout = 0.)
+
+    
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, matrix_pose={}, \
+            dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, self.matrix_pose,
+            self.dropout_rate
+        )        
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # b: batch size
+        # n: num of capsules in current layer
+        # a: dim of capsules in current layer
+        # m: num of capsules in next layer
+        # d: dim of capsules in next layer
+        # print("Input ", input.shape)
+        if len(input.shape) == 5:
+            input = input.permute(0, 4, 1, 2, 3)
+            input = input.contiguous().view(input.shape[0], input.shape[1], -1)
+            input = input.permute(0,2,1)
+
+        # print("Transformed ", input.shape)
+        batch_size = input.shape[0]
+        next_capsule_value = self.linformer_attention(current_pose=input, h_out=1, w_out=1, next_pose=next_capsule_value)
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            next_capsule_value = self.nonlinear_act(next_capsule_value)
+        return next_capsule_value
+
+class LACapsuleCONV(nn.Module):
+    r"""Applies as a capsule convolutional layer.
+    TBD
+    """
+    def __init__(self, in_n_capsules, in_d_capsules, out_n_capsules, out_d_capsules, 
+                 kernel_size, stride, input_img_size, output_img_size, hidden_dim,matrix_pose, dp, padding=None, coordinate_add=False):
+        super(LACapsuleCONV, self).__init__()
+        self.in_n_capsules = in_n_capsules
+        self.in_d_capsules = in_d_capsules
+        self.out_n_capsules = out_n_capsules
+        self.out_d_capsules = out_d_capsules
+        self.input_img_size = input_img_size
+        self.output_img_size = output_img_size
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.matrix_pose = matrix_pose
+        self.coordinate_add = coordinate_add
+        self.padding = padding
+        
+        self.nonlinear_act = nn.LayerNorm(out_d_capsules)
+        self.dropout_rate = dp
+        self.drop = nn.Dropout(self.dropout_rate)
+
+        self.linformer_attention = LinformerProjectionKernel(in_n_capsules=in_n_capsules, in_d_capsules=in_d_capsules, out_n_capsules=out_n_capsules, 
+                                                     out_d_capsules=out_d_capsules, matrix_pose=self.matrix_pose, layer_type='conv', input_img_size = input_img_size, output_img_size = output_img_size, 
+                                                     hidden_dim=hidden_dim, kernel_size=kernel_size, dropout = 0.)
+
+    def extra_repr(self):
+        return 'in_n_capsules={}, in_d_capsules={}, out_n_capsules={}, out_d_capsules={}, \
+                    kernel_size={}, stride={}, coordinate_add={}, matrix_pose={},  \
+                    dropout_rate={}'.format(
+            self.in_n_capsules, self.in_d_capsules, self.out_n_capsules, self.out_d_capsules, 
+            self.kernel_size, self.stride, self.coordinate_add, self.matrix_pose, 
+            self.dropout_rate
+            )       
+             
+    def input_expansion(self, input):
+        # input has size [batch x num_of_capsule x height x width x  x capsule_dimension]
+        if self.padding:
+            input = input.permute([0,1,4,2,3]) #For padding h,w
+            if not self.padding%1:
+                input = F.pad(input, [self.padding, self.padding, self.padding, self.padding]) #TODO: Padding to maintain same size, change so that caps dim not padded
+            else:
+                input = F.pad(input, [math.ceil(self.padding), math.floor(self.padding), math.ceil(self.padding), math.floor(self.padding)]) #TODO: Padding to maintain same size, change so that caps dim not padded
+            input = input.permute([0,1,3,4,2])
+        unfolded_input = input.unfold(2,size=self.kernel_size,step=self.stride).unfold(3,size=self.kernel_size,step=self.stride)
+        unfolded_input = unfolded_input.permute([0,1,5,6,2,3,4])
+        # output has size [batch x num_of_capsule x kernel_size x kernel_size x h_out x w_out x capsule_dimension]
+        return unfolded_input
+    
+    def forward(self, input, num_iter, next_capsule_value=None):
+        # k,l: kernel size
+        # h,w: output width and length 
+        inputs = self.input_expansion(input)
+        batch_size = inputs.shape[0]
+        h_out = inputs.shape[4]
+        w_out = inputs.shape[5] 
+        next_capsule_value = self.linformer_attention(current_pose=inputs, h_out=h_out, w_out=w_out, next_pose=next_capsule_value)
+        next_capsule_value = self.drop(next_capsule_value)
+        if not next_capsule_value.shape[-1] == 1:
+            next_capsule_value = self.nonlinear_act(next_capsule_value)                
+        return next_capsule_value   
 
 
